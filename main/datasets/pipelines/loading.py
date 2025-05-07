@@ -1673,3 +1673,44 @@ class LoadProposals:
                     f'proposal_ext={self.proposal_ext}, '
                     f'feature_ext={self.feature_ext})')
         return repr_str
+
+
+@PIPELINES.register_module()
+class SlidingWindowSampler:
+    """在 pipeline 中动态滑窗采样 frame_inds。
+
+    Args:
+        window_size (int): 每个窗口帧数。
+        stride (int): 窗口滑动步长。
+        test_mode (bool): 测试时是否使用中点窗口。
+    """
+    def __init__(self, window_size, stride, test_mode=False):
+        self.window_size = window_size
+        self.stride = stride
+        self.test_mode = test_mode
+
+    def __call__(self, results):
+        total = results['total_frames']
+        # 计算所有合法起始位置
+        starts = list(range(0, max(1, total - self.window_size + 1), self.stride))
+        if not starts:
+            starts = [0]
+        # 训练随机选，测试取中点
+        if self.test_mode:
+            start = starts[len(starts) // 2]
+        else:
+            start = random.choice(starts)
+        # 连续 window_size 帧
+        frame_inds = np.arange(start, start + self.window_size)
+        # 填回 results
+        results['frame_inds'] = frame_inds
+        results['clip_len'] = self.window_size
+        results['frame_interval'] = 1
+        results['num_clips'] = 1
+        return results
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}('
+                f'window_size={self.window_size}, '
+                f'stride={self.stride}, '
+                f'test_mode={self.test_mode})')

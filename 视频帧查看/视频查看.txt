@@ -1,0 +1,3 @@
+./video_info.py 路径/到/视频文件.mp4
+# 或者
+./video_info_decord.py 路径/到/视频文件.mp4 --verify
