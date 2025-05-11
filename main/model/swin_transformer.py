@@ -34,7 +34,7 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
-
+#分窗口并且把三维数据view成一维数据
 def window_partition(x, window_size):
     """
     Args:
@@ -67,7 +67,7 @@ def window_reverse(windows, window_size, B, D, H, W):
 
 
 
-
+#如果输入的x_size小于window_size，那么就将window_size设置为x_size，并且shift_size设置为0
 def get_window_size(x_size, window_size, shift_size=None):
     use_window_size = list(window_size)
     if shift_size is not None:
@@ -125,7 +125,7 @@ class WindowAttention3D(nn.Module):
         relative_coords[:, :, 0] *= (2 * self.window_size[1] - 1) * (2 * self.window_size[2] - 1)
         relative_coords[:, :, 1] *= (2 * self.window_size[2] - 1)
         relative_position_index = relative_coords.sum(-1)  # Wd*Wh*Ww, Wd*Wh*Ww
-        self.register_buffer("relative_position_index", relative_position_index)
+        self.register_buffer("relative_position_index", relative_position_index)#暂时注册在缓冲区不进行学习
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -137,11 +137,11 @@ class WindowAttention3D(nn.Module):
 
     def forward(self, x, mask=None):
         """ Forward function.
-        Args:
+        Args:相当于抽出来了窗口维度，这样子就只有单个窗口内的token进行注意力计算了
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, N, N) or None
         """
-        B_, N, C = x.shape
+        B_, N, C = x.shape#这里N已经是窗口内的token数量了
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # B_, nH, N, C
 
@@ -149,14 +149,14 @@ class WindowAttention3D(nn.Module):
         attn = q @ k.transpose(-2, -1)
 
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index[:N, :N].reshape(-1)].reshape(
-            N, N, -1)  # Wd*Wh*Ww,Wd*Wh*Ww,nH
+            N, N, -1)  # Wd*Wh*Ww,Wd*Wh*Ww,nH   #本身就是Wd*Wh*Ww=N
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wd*Wh*Ww, Wd*Wh*Ww
         attn = attn + relative_position_bias.unsqueeze(0) # B_, nH, N, N
-
+       
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)#增加维度，把窗口数量维度列出来，才能和mask相加
+            attn = attn.view(-1, self.num_heads, N, N)#再合并
             attn = self.softmax(attn)
         else:
             attn = self.softmax(attn)
@@ -164,14 +164,15 @@ class WindowAttention3D(nn.Module):
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x = self.proj(x)
+        x = self.proj(x)#维度不变
         x = self.proj_drop(x)
         return x
 
 
 class SwinTransformerBlock3D(nn.Module):
     """ Swin Transformer Block.
-
+    输入的x的shape为(B, D, H, W, C)，其中B为batch_size，D为时间维度，H为高度，W为宽度，C为通道数
+    输出的x没有发生改变，shape为(B, D, H, W, C)
     Args:
         dim (int): Number of input channels.
         num_heads (int): Number of attention heads.
@@ -211,39 +212,39 @@ class SwinTransformerBlock3D(nn.Module):
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-
+        
     def forward_part1(self, x, mask_matrix):
         B, D, H, W, C = x.shape
         window_size, shift_size = get_window_size((D, H, W), self.window_size, self.shift_size)
 
         x = self.norm1(x)
-        # pad feature maps to multiples of window size
+        # 填充来保证能窗口分割
         pad_l = pad_t = pad_d0 = 0
         pad_d1 = (window_size[0] - D % window_size[0]) % window_size[0]
         pad_b = (window_size[1] - H % window_size[1]) % window_size[1]
         pad_r = (window_size[2] - W % window_size[2]) % window_size[2]
         x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b, pad_d0, pad_d1))
         _, Dp, Hp, Wp, _ = x.shape
-        # cyclic shift
+        # 滑动窗口
         if any(i > 0 for i in shift_size):
             shifted_x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1], -shift_size[2]), dims=(1, 2, 3))
             attn_mask = mask_matrix
         else:
             shifted_x = x
             attn_mask = None
-        # partition windows
+        # partition windows此时窗口与批次融合，为的是能够把各窗口N列出来进行注意力计算
         x_windows = window_partition(shifted_x, window_size)  # B*nW, Wd*Wh*Ww, C
         # W-MSA/SW-MSA
         attn_windows = self.attn(x_windows, mask=attn_mask)  # B*nW, Wd*Wh*Ww, C
         # merge windows
-        attn_windows = attn_windows.view(-1, *(window_size+(C,)))
-        shifted_x = window_reverse(attn_windows, window_size, B, Dp, Hp, Wp)  # B D' H' W' C
-        # reverse cyclic shift
+        attn_windows = attn_windows.view(-1, *(window_size+(C,)))#等价于attn_windows.view(-1, window_size[0], window_size[1], window_size[2], C)
+        shifted_x = window_reverse(attn_windows, window_size, B, Dp, Hp, Wp)  # B D' H' W' C变回windowspartition之前的形状
+        # reverse cyclic shift    #roll回去
         if any(i > 0 for i in shift_size):
             x = torch.roll(shifted_x, shifts=(shift_size[0], shift_size[1], shift_size[2]), dims=(1, 2, 3))
         else:
             x = shifted_x
-
+        # 去除填充
         if pad_d1 >0 or pad_r > 0 or pad_b > 0:
             x = x[:, :D, :H, :W, :].contiguous()
         return x
@@ -257,6 +258,9 @@ class SwinTransformerBlock3D(nn.Module):
         Args:
             x: Input feature, tensor size (B, D, H, W, C).
             mask_matrix: Attention mask for cyclic shift.
+            当 self.use_checkpoint=True 时，会使用PyTorch的 checkpoint.
+            在前向传播时不保存中间激活值，而是在反向传播时重新计算这些激活值。这
+            可以显著减少显存使用，特别是对于深层网络
         """
 
         shortcut = x
@@ -313,10 +317,10 @@ class PatchMerging(nn.Module):
 
 
 # cache each stage results
-@lru_cache()
+
 def compute_mask(D, H, W, window_size, shift_size, device):
     img_mask = torch.zeros((1, D, H, W, 1), device=device)  # 1 Dp Hp Wp 1
-    cnt = 0
+    cnt = 0#沿着真实切割位置分块赋-∞
     for d in slice(-window_size[0]), slice(-window_size[0], -shift_size[0]), slice(-shift_size[0],None):
         for h in slice(-window_size[1]), slice(-window_size[1], -shift_size[1]), slice(-shift_size[1],None):
             for w in slice(-window_size[2]), slice(-window_size[2], -shift_size[2]), slice(-shift_size[2],None):
@@ -324,7 +328,7 @@ def compute_mask(D, H, W, window_size, shift_size, device):
                 cnt += 1
     mask_windows = window_partition(img_mask, window_size)  # nW, ws[0]*ws[1]*ws[2], 1
     mask_windows = mask_windows.squeeze(-1)  # nW, ws[0]*ws[1]*ws[2]
-    attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+    attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)#没有被切的完整窗口所有数字一定是相同的，所以广播后相减结果是0
     attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
     return attn_mask
 
@@ -422,7 +426,7 @@ class PatchEmbed3D(nn.Module):
         embed_dim (int): Number of linear projection output channels. Default: 96.
         norm_layer (nn.Module, optional): Normalization layer. Default: None
     """
-    def __init__(self, patch_size=(2,4,4), in_chans=3, embed_dim=96, norm_layer=None):
+    def __init__(self, patch_size=(2,4,4), in_chans=1, embed_dim=96, norm_layer=None):
         super().__init__()
         self.patch_size = patch_size
 
@@ -455,7 +459,7 @@ class PatchEmbed3D(nn.Module):
 
         return x
 
-@BACKBONES.register_module()
+
 class SwinTransformer3D(nn.Module):
     """ Swin Transformer backbone.
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
@@ -484,7 +488,7 @@ class SwinTransformer3D(nn.Module):
                  pretrained=None,
                  pretrained2d=True,
                  patch_size=(4,4,4),
-                 in_chans=3,
+                 in_chans=1,
                  embed_dim=96,
                  depths=[2, 2, 6, 2],
                  num_heads=[3, 6, 12, 24],

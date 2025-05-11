@@ -36,7 +36,7 @@ def preprocess_sample(
     # 7. 随机水平翻转
     results = Flip(flip_ratio=0.5)(results)
     # 8. Pad 到能被 patch/window 整除
-    results = PadTo((1, 4, 4))(results)
+    results = PadTo((2, 4, 4))(results)
 
     # 9. 转为 Tensor 并归一化
     # 先做归一化
