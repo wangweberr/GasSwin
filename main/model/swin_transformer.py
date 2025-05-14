@@ -3,16 +3,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 import numpy as np
-from timm.models.layers import DropPath, trunc_normal_
-
-from mmcv.runner import load_checkpoint
-from mmaction.utils import get_root_logger
-from ..builder import BACKBONES
-
-from functools import reduce, lru_cache
+from functools import reduce
 from operator import mul
 from einops import rearrange
-
+from head.fpn_head import FPNHead
+from torch.nn.init import trunc_normal_
+from mmcv.cnn.bricks import DropPath
+from mmcv.runner import load_checkpoint
+from mmcv.utils import get_root_logger
 
 class Mlp(nn.Module):
     """ Multilayer perceptron."""
@@ -132,7 +130,7 @@ class WindowAttention3D(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        trunc_normal_(self.relative_position_bias_table, std=.02)
+        trunc_normal_(self.relative_position_bias_table, mean=0.0, std=.02,a=-2.0,b=2.0)
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, mask=None):
@@ -199,6 +197,7 @@ class SwinTransformerBlock3D(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.use_checkpoint=use_checkpoint
 
+        
         assert 0 <= self.shift_size[0] < self.window_size[0], "shift_size must in 0-window_size"
         assert 0 <= self.shift_size[1] < self.window_size[1], "shift_size must in 0-window_size"
         assert 0 <= self.shift_size[2] < self.window_size[2], "shift_size must in 0-window_size"
@@ -212,7 +211,9 @@ class SwinTransformerBlock3D(nn.Module):
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-        
+
+
+
     def forward_part1(self, x, mask_matrix):
         B, D, H, W, C = x.shape
         window_size, shift_size = get_window_size((D, H, W), self.window_size, self.shift_size)
@@ -248,7 +249,7 @@ class SwinTransformerBlock3D(nn.Module):
         if pad_d1 >0 or pad_r > 0 or pad_b > 0:
             x = x[:, :D, :H, :W, :].contiguous()
         return x
-
+    #drop_path随机输出为0或1，所以drop_path(x)随机输出为x或0
     def forward_part2(self, x):
         return self.drop_path(self.mlp(self.norm2(x)))
 
@@ -311,7 +312,7 @@ class PatchMerging(nn.Module):
         x = torch.cat([x0, x1, x2, x3], -1)  # B D H/2 W/2 4*C
 
         x = self.norm(x)
-        x = self.reduction(x)
+        x = self.reduction(x)#通道变为2*C
 
         return x
 
@@ -332,7 +333,7 @@ def compute_mask(D, H, W, window_size, shift_size, device):
     attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
     return attn_mask
 
-
+#基础层，组成blocks和downsample
 class BasicLayer(nn.Module):
     """ A basic Swin Transformer layer for one stage.
 
@@ -356,15 +357,17 @@ class BasicLayer(nn.Module):
                  depth,
                  num_heads,
                  window_size=(1,7,7),
-                 mlp_ratio=4.,
+                 mlp_ratio=4.,  # MLP扩展比率，hidden_dim = embed_dim * ratio
                  qkv_bias=False,
-                 qk_scale=None,
+                 qk_scale=None,  # 注意力分数缩放因子，None表示自动计算(head_dim^-0.5)
                  drop=0.,
                  attn_drop=0.,
                  drop_path=0.,
-                 norm_layer=nn.LayerNorm,
+                 norm_layer=nn.LayerNorm,  # 标准化层类型，保持默认即可
                  downsample=None,
-                 use_checkpoint=False):
+                 use_checkpoint=False,
+            
+                 ):  # 是否使用梯度检查点(节省显存但降低训练速度)
         super().__init__()
         self.window_size = window_size
         self.shift_size = tuple(i // 2 for i in window_size)
@@ -386,6 +389,7 @@ class BasicLayer(nn.Module):
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                 norm_layer=norm_layer,
                 use_checkpoint=use_checkpoint,
+
             )
             for i in range(depth)])
         
@@ -485,26 +489,25 @@ class SwinTransformer3D(nn.Module):
     """
 
     def __init__(self,
-                 pretrained=None,
-                 pretrained2d=True,
-                 patch_size=(4,4,4),
-                 in_chans=1,
-                 embed_dim=96,
-                 depths=[2, 2, 6, 2],
-                 num_heads=[3, 6, 12, 24],
-                 window_size=(2,7,7),
-                 mlp_ratio=4.,
-                 qkv_bias=True,
-                 qk_scale=None,
-                 drop_rate=0.,
-                 attn_drop_rate=0.,
-                 drop_path_rate=0.2,
-                 norm_layer=nn.LayerNorm,
-                 patch_norm=False,
-                 frozen_stages=-1,
-                 use_checkpoint=False):
+                 pretrained=None,  # 预训练权重路径(None表示不加载)，支持Kinetics等视频数据集预训练
+                 pretrained2d=False,  # 是否使用2D图像预训练权重（适用于从Swin-Image模型迁移学习）
+                 patch_size=(2,4,4),  # 三维patch切割尺寸(时间,高,宽)，需能被输入视频尺寸整除
+                 in_chans=1,  # 输入通道数，灰度视频为1，RGB视频为3，多模态可扩展
+                 embed_dim=96,  # 基础嵌入维度，后续各stage按[dim*2^i for i in range(len(depths))]扩展
+                 depths=[2, 2, 6, 2],  # 各stage的block数量，控制网络深度和感受野大小
+                 num_heads=[3, 6, 12, 24],  # 各stage的注意力头数，需与embed_dim可整除
+                 window_size=(2,7,7),  # 时空注意力窗口(时间,高,宽)，时间窗较小以保持时序关系
+                 mlp_ratio=4.,  # MLP扩展比率，hidden_dim = embed_dim * ratio
+                 qkv_bias=True,  # 是否为qkv线性层添加可学习偏置
+                 qk_scale=None,  # 注意力分数缩放因子，None表示自动计算(head_dim^-0.5)
+                 drop_rate=0.,  # 全连接层基础dropout率
+                 attn_drop_rate=0.,  # 注意力权重dropout率
+                 drop_path_rate=0.2,  # stochastic depth衰减率，深层block有更高概率被drop
+                 norm_layer=nn.LayerNorm,  # 标准化层类型，保持默认即可
+                 patch_norm=False,  # 是否在patch embedding后添加norm层
+                 frozen_stages=-1,  # 冻结前n个stage的参数(-1表示不冻结)，用于迁移学习
+                 use_checkpoint=False):  # 是否使用梯度检查点(节省显存但降低训练速度)
         super().__init__()
-
         self.pretrained = pretrained
         self.pretrained2d = pretrained2d
         self.num_layers = len(depths)
@@ -547,9 +550,15 @@ class SwinTransformer3D(nn.Module):
 
         # add a norm layer for each output
         self.norm = norm_layer(self.num_features)
-
+        self.head = FPNHead(
+                                in_channels=[96, 192, 384, 768],  # 根据backbone各层的通道数
+                                feature_strides=[4, 8, 16, 32],   # 根据下采样率
+                                out_channels=1                    # 分割输出通道数
+                            )
         self._freeze_stages()
-
+        if pretrained:
+            self.init_weights()
+    #冻结前n层的参数
     def _freeze_stages(self):
         if self.frozen_stages >= 0:
             self.patch_embed.eval()
@@ -644,8 +653,37 @@ class SwinTransformer3D(nn.Module):
                 # Inflate 2D model into 3D model.
                 self.inflate_weights(logger)
             else:
-                # Directly load 3D model.
-                load_checkpoint(self, self.pretrained, strict=False, logger=logger)
+                # 先加载权重到内存
+                checkpoint = torch.load(self.pretrained, map_location='cpu')
+                state_dict = checkpoint['model']
+                # 处理 "module." 前缀 
+                from collections import OrderedDict
+                new_state_dict = OrderedDict()
+                has_module_prefix = False
+                for k, v in state_dict.items():
+                    if k.startswith('module.'):
+                        has_module_prefix = True
+                        name = k[7:]  # remove 'module.'
+                        new_state_dict[name] = v
+                    else:
+                        new_state_dict[k] = v # 如果有些键没有module.前缀，也保留
+                
+                if has_module_prefix:
+                    logger.info("Detected 'module.' prefix in pretrained state_dict, removing it.")
+                    state_dict = new_state_dict # 使用处理了前缀的 state_dict
+  
+                # 处理通道数不匹配
+                if 'patch_embed.proj.weight' in state_dict:
+                    old_weight = state_dict['patch_embed.proj.weight']  # [96, 3, 2, 4, 4]
+                    if old_weight.shape[1] != self.patch_embed.proj.weight.shape[1]:
+                        print(f"处理输入通道不匹配: {old_weight.shape[1]} -> {self.patch_embed.proj.weight.shape[1]}")
+                        # 取均值转换为单通道
+                        new_weight = old_weight.mean(dim=1, keepdim=True)
+                        state_dict['patch_embed.proj.weight'] = new_weight
+                
+                # 然后加载修改后的权重
+                msg = self.load_state_dict(state_dict, strict=False)
+                print(f"加载预训练权重: {msg}")
         elif self.pretrained is None:
             self.apply(_init_weights)
         else:
@@ -654,20 +692,18 @@ class SwinTransformer3D(nn.Module):
     def forward(self, x):
         """Forward function."""
         x = self.patch_embed(x)
-
         x = self.pos_drop(x)
-
+        outs=[]
         for layer in self.layers:
             x = layer(x.contiguous())
+           
+            outs.append(x)
+        fpn_outs=self.head(outs)
 
-        x = rearrange(x, 'n c d h w -> n d h w c')
-        x = self.norm(x)
-        x = rearrange(x, 'n d h w c -> n c d h w')
-
-        return x
+        return fpn_outs
 
     def train(self, mode=True):
-        """Convert the model into training mode while keep layers freezed."""
+        """为了冻结前n个stage的参数，需要重写train方法"""
         super(SwinTransformer3D, self).train(mode)
         self._freeze_stages()
 

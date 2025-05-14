@@ -3,14 +3,10 @@ import os
 from pipeline import (RandomCrop, SlidingWindowSampler, Resize, PadTo, ToTensor, Normalize, FormatShape,DecordDecode,DecordInit,
                       LoadMaskFromVideo,Flip)
 
-def preprocess_sample(
-                      window_size=32,
-                      stride=16,):
-    # 1. 构造最初的 results
-    results = {
-        'mask_video': '/home/chenli/weber/Video-Swin-Transformer/simulated_gas/smoke_only1.mp4',
-        'filename': '/home/chenli/weber/Video-Swin-Transformer/simulated_gas/simgasvid1.mp4'
-    }
+def preprocess_sample(results):
+
+    window_size=results['window_size']
+    stride=results['stride']
     
    
     # 2. 滑窗采样
@@ -49,7 +45,7 @@ def preprocess_sample(
     results = FormatShape(input_format='NCTHW')(results)
 
     # 此时 results['imgs'] 就是模型要的 Tensor[N, C, T, H, W]
-    #     results['gt_seg_maps'] 就是 Tensor[N, T, H, W]
+    #     results['gt_seg_maps'] 就是 Tensor[N, C, T, H, W]
     return results
 
 

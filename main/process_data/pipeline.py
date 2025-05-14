@@ -1,12 +1,14 @@
 # custom_pipeline.py
 
-
+import os
 import random
 import numpy as np
 import torch
 import cv2
 import decord
 from decord import VideoReader, cpu
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
 
 
 
@@ -16,25 +18,33 @@ class SlidingWindowSampler:
         self.window_size = window_size
         self.stride = stride
         self.test_mode = test_mode
-
     def __call__(self, results):
         if 'total_frames' not in results:
             results['total_frames'] = 451
-        total = results['total_frames']
-        starts = list(range(0, max(1, total - self.window_size + 1), self.stride))
-        if not starts:
-            starts = [0]
-        if self.test_mode:
-            start = starts[len(starts) // 2]
-        else:
-            start = random.choice(starts)
-        inds = np.arange(start, start + self.window_size)
+        inds=[]
+        Video_incdice=[]
+        for i,total in enumerate(results['total_frames']):
+            video_inds = []
+            starts = list(range(0, max(1, total - self.window_size + 1), self.stride))
+            if not starts:
+                starts = [0]
+            if self.test_mode:
+                # 测试模式取所有窗口
+                video_inds = [np.arange(s, s+self.window_size) for s in starts]
+            else:
+                # 训练模式随机选择多个窗口
+                max_samples = max(1, (total - self.window_size) // self.stride + 1)
+                selected_starts = random.choices(starts, k=max_samples)
+                video_inds = [np.arange(s, s+self.window_size) for s in selected_starts]
+            video_inds = [np.clip(ind, 0, total - 1) for ind in video_inds]
+            inds.extend(video_inds) 
+            for s in video_inds:
+                results['video_indices'].append(i)
+           
         # 保证不越界
-        inds = np.clip(inds, 0, total - 1)
         results['frame_inds'] = inds
         results['clip_len'] = self.window_size
         results['frame_interval'] = 1
-        results['num_clips'] = 1
         return results
 
 
@@ -67,19 +77,24 @@ class Resize:
         self.h, self.w = scale
 
     def __call__(self, results):
-        imgs = results['imgs']  # T×H×W
-        T = imgs.shape[0]
-        resized = [cv2.resize(img, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
-                   for img in imgs]
-        results['imgs'] = np.stack(resized, axis=0)
-        if 'gt_seg_maps' in results:
-            segs = results['gt_seg_maps']
-            resizedm = [cv2.resize(m, (self.w, self.h),
-                                   interpolation=cv2.INTER_NEAREST)
-                        for m in segs]
-            results['gt_seg_maps'] = np.stack(resizedm, axis=0)
-        # 更新 img_shape
-        results['img_shape'] = (self.h, self.w)
+        processed_imgs = []
+        processed_segs = []
+        
+        for vid_imgs in results['imgs']:
+            T = vid_imgs.shape[0]
+            resized = [cv2.resize(img, (self.w, self.h), interpolation=cv2.INTER_LINEAR) 
+                      for img in vid_imgs]
+            processed_imgs.append(np.stack(resized, axis=0))
+            
+            if 'gt_seg_maps' in results:
+                vid_segs = [cv2.resize(m, (self.w, self.h), interpolation=cv2.INTER_NEAREST)
+                           for m in results['gt_seg_maps'][results['imgs'].index(vid_imgs)]]
+                processed_segs.append(np.stack(vid_segs, axis=0))
+        
+        results['imgs'] = processed_imgs
+        if processed_segs:
+            results['gt_seg_maps'] = processed_segs
+        results['img_shape'] = [(self.h, self.w)] * len(processed_imgs)
         return results
 
 
@@ -90,21 +105,30 @@ class PadTo:
         self.dd, self.dh, self.dw = size_divisor
 
     def __call__(self, results):
-        imgs = results['imgs']  # T×H×W×C
-        T, H, W = imgs.shape
-        pd = (self.dd - T % self.dd) % self.dd
-        ph = (self.dh - H % self.dh) % self.dh
-        pw = (self.dw - W % self.dw) % self.dw
-        imgs = np.pad(imgs,
-                      ((0, pd), (0, ph), (0, pw), (0, 0)),
-                      mode='constant', constant_values=0)
-        results['imgs'] = imgs
-        if 'gt_seg_maps' in results:
-            segs = results['gt_seg_maps']  # T×H×W
-            segs = np.pad(segs,
-                          ((0, pd), (0, ph), (0, pw)),
-                          mode='constant', constant_values=0)
-            results['gt_seg_maps'] = segs
+        padded_imgs = []
+        padded_segs = []
+        
+        for vid_imgs in results['imgs']:
+            T, H, W = vid_imgs.shape[:3]
+            pd = (self.dd - T % self.dd) % self.dd
+            ph = (self.dh - H % self.dh) % self.dh
+            pw = (self.dw - W % self.dw) % self.dw
+            
+            vid_padded = np.pad(vid_imgs,
+                ((0, pd), (0, ph), (0, pw), (0, 0)),
+                mode='constant', constant_values=0)
+            padded_imgs.append(vid_padded)
+            
+            if 'gt_seg_maps' in results:
+                vid_segs = results['gt_seg_maps'][results['imgs'].index(vid_imgs)]
+                seg_padded = np.pad(vid_segs,
+                    ((0, pd), (0, ph), (0, pw)),
+                    mode='constant', constant_values=0)
+                padded_segs.append(seg_padded)
+        
+        results['imgs'] = padded_imgs
+        if padded_segs:
+            results['gt_seg_maps'] = padded_segs
         return results
 
 
@@ -117,15 +141,24 @@ class RandomCrop:
     def __call__(self, results):
         if random.random()<self.ratio:
             return results
-        imgs = results['imgs']
-        T, H, W = imgs.shape
-        top = random.randint(0, max(0, H - self.h))
-        left = random.randint(0, max(0, W - self.w))
-        results['imgs'] = imgs[:, top:top+self.h, left:left+self.w, :]
-        if 'gt_seg_maps' in results:
-            segs = results['gt_seg_maps']
-            results['gt_seg_maps'] = segs[:, top:top+self.h, left:left+self.w]
-        results['img_shape'] = (self.h, self.w)
+        
+        cropped_imgs = []
+        cropped_segs = []
+        
+        for vid_imgs in results['imgs']:
+            T, H, W = vid_imgs.shape[:3]
+            top = random.randint(0, max(0, H - self.h))
+            left = random.randint(0, max(0, W - self.w))
+            cropped_imgs.append(vid_imgs[:, top:top+self.h, left:left+self.w, :])
+            
+            if 'gt_seg_maps' in results:
+                vid_segs = results['gt_seg_maps'][results['imgs'].index(vid_imgs)]
+                cropped_segs.append(vid_segs[:, top:top+self.h, left:left+self.w])
+        
+        results['imgs'] = cropped_imgs
+        if cropped_segs:
+            results['gt_seg_maps'] = cropped_segs
+        results['img_shape'] = [(self.h, self.w)] * len(cropped_imgs)
         return results
 
 
@@ -135,15 +168,19 @@ class Flip:
         self.flip_ratio = flip_ratio
 
     def __call__(self, results):
-        if random.random() < self.flip_ratio:
-            imgs = results['imgs']
-            results['imgs'] = imgs[:, :, ::-1, :]
-            if 'gt_seg_maps' in results:
-                segs = results['gt_seg_maps']
-                results['gt_seg_maps'] = segs[:, :, ::-1]
-            results['flip'] = True
-        else:
-            results['flip'] = False
+        flip_flags = []
+        
+        for i in range(len(results['imgs'])):
+            if random.random() < self.flip_ratio:
+                # 水平翻转当前视频
+                results['imgs'][i] = results['imgs'][i][:, :, ::-1, :]
+                if 'gt_seg_maps' in results:
+                    results['gt_seg_maps'][i] = results['gt_seg_maps'][i][:, :, ::-1]
+                flip_flags.append(True)
+            else:
+                flip_flags.append(False)
+        
+        results['flip'] = flip_flags
         return results
 
 
@@ -155,13 +192,13 @@ class Normalize:
         self.to_bgr = to_bgr
 
     def __call__(self, results):
-        imgs = results['imgs'].astype(np.float32)  # T×H×W×C
-        if self.to_bgr:
-            imgs = imgs[..., ::-1]
-        # 逐通道归一化
-        for c in range(imgs.shape[-1]):
-            imgs[..., c] = (imgs[..., c] - self.mean[c]) / self.std[c]
-        results['imgs'] = imgs
+        for i,vid_imgs in enumerate(results['imgs']):
+            vid_imgs = vid_imgs.astype(np.float32)
+            if self.to_bgr:
+                vid_imgs = vid_imgs[..., ::-1]
+            for c in range(vid_imgs.shape[-1]):#对每个通道进行归一化，我这里都默认是(0,1)
+                vid_imgs[..., c] = (vid_imgs[..., c] - self.mean[c]) / self.std[c]
+            results['imgs'][i]=vid_imgs
         return results
 
 
@@ -172,14 +209,15 @@ class ToTensor:
 
     def __call__(self, results):
         for k in self.keys:
-            arr = results[k]
-            if isinstance(arr, np.ndarray):
-                # segs: T×H×W → T×H×W（long）
-                # imgs: T×H×W×C → C×T×H×W
-                if k == 'imgs':
-                    # transpose to C×T×H×W
-                    arr = arr.transpose(3, 0, 1, 2)
-                results[k] = torch.from_numpy(arr)
+            if isinstance(results[k], list):
+                # 处理多视频列表
+                tensor_list = []
+                for vid_arr in results[k]:
+                    if isinstance(vid_arr, np.ndarray):
+                        if k == 'imgs':
+                            vid_arr = vid_arr.transpose(3, 0, 1, 2)
+                        tensor_list.append(torch.from_numpy(vid_arr))
+                results[k] = tensor_list
         return results
 
 
@@ -190,10 +228,26 @@ class FormatShape:
         self.input_format = input_format
 
     def __call__(self, results):
-        imgs = results['imgs']  # Tensor C×T×H×W
-        # N=1 时直接 unsqueeze
-        results['imgs'] = imgs.unsqueeze(0)  # 1×C×T×H×W
-        results['input_shape'] = tuple(results['imgs'].shape)#touple显式转换
+        imgs_list = results['imgs']
+        processed_imgs = []
+        input_shapes = []
+        masks_list = results['gt_seg_maps']
+        processed_masks = []
+        
+        for imgs in imgs_list:
+            # 为每个视频添加批次维度
+            processed = imgs.unsqueeze(0)  # 1×C×T×H×W
+            processed_imgs.append(processed)
+            input_shapes.append(tuple(processed.shape))
+        
+        for mask in masks_list:
+                # mask 形状为 [T,H,W]，添加通道维度和批次维度
+            processed = mask.unsqueeze(0).unsqueeze(0)  # [1,1,T,H,W]
+            processed_masks.append(processed)
+            
+        results['gt_seg_maps'] = processed_masks
+        results['imgs'] = processed_imgs
+        results['input_shape'] = input_shapes
         return results
 
 
@@ -222,15 +276,19 @@ class DecordInit:
         except ImportError:
             raise ImportError(
                 'Please run "pip install decord" to install Decord first.')
-        
+        all_file=os.listdir(results['filename'])
+        mp4_file=[f for f in all_file if f.endswith('.mp4')]
+        full_path=[]
      # 直接用文件路径解码，无需 FileClient/io.BytesIO
-        from decord import VideoReader, cpu
-        container = VideoReader(results['filename'],
+        for file_name in mp4_file:
+            full_path.append(os.path.join(results['filename'],file_name))
+        results['video_paths']=full_path
+        for file in full_path: 
+            container = VideoReader(file,
                                 ctx=cpu(0),
                                 num_threads=self.num_threads)
-
-        results['video_reader'] = container
-        results['total_frames'] = len(container)
+            results['video_readers'].append(container)
+            results['total_frames'].append(len(container))
         return results
 
     
@@ -254,21 +312,17 @@ class DecordDecode:
             results (dict): The resulting dict to be modified and passed
                 to the next transform in pipeline.
         """
-        container = results['video_reader']
-
-        if results['frame_inds'].ndim != 1:
-            results['frame_inds'] = np.squeeze(results['frame_inds'])
-
-        frame_inds = results['frame_inds']
-        # Generate frame index mapping in order
-        imgs = container.get_batch(frame_inds).asnumpy()
-
-        results['video_reader'] = None
-        del container
-
-        results['imgs'] = imgs
-        results['original_shape'] = imgs[0].shape[:2]
-        results['img_shape'] = imgs[0].shape[:2]
+        
+        for ind,index in zip(results['frame_inds'],results['video_indices']):
+            container = results['video_readers'][index] 
+            # ind: T or ndarr
+            if ind.ndim != 1:
+               ind = np.squeeze(ind)
+             # Generate frame index mapping in order
+            imgs = container.get_batch(ind).asnumpy()
+            results['imgs'].append(imgs)
+            results['original_shape'].append(imgs[0].shape[:2])
+            results['img_shape'].append(imgs[0].shape[:2])
 
         return results
 
@@ -286,21 +340,83 @@ class LoadMaskFromVideo:
 
     def __call__(self, results):
         # 1. 获取 mask 视频路径 和 需要的帧索引
-        mask_path = results[self.mask_key]
+        all_mask=os.listdir(results[self.mask_key])
+        mask_file=[f for f in all_mask if f.endswith('.mp4')]
         inds = results[self.frame_inds_key]
+        for file in mask_file:
+            results['mask_location'].append(os.path.join(results[self.mask_key],file))
+        for index,ind in zip(results['video_indices'],inds):
+            # 2. 用 Decord 一次性批量读取指定帧
+            vr = decord.VideoReader(results['mask_location'][index], ctx=cpu(0))
+            frames = vr.get_batch(ind).asnumpy()  # shape: (T, H, W, C) 或 (T, H, W)
 
-        # 2. 用 Decord 一次性批量读取指定帧
-        vr = decord.VideoReader(mask_path, ctx=cpu(0))
-        frames = vr.get_batch(inds).asnumpy()  # shape: (T, H, W, C) 或 (T, H, W)
+            # 3. 转灰度（若是三通道）并二值化（>0 视作前景）
+            if  frames.ndim == 4 and frames.shape[-1] == 1:
+                gray = frames[..., 0]#通道剔除
+            else:
+                gray = frames  # 本身就 (T,H,W)
 
-        # 3. 转灰度（若是三通道）并二值化（>0 视作前景）
-        if  frames.ndim == 4 and frames.shape[-1] == 1:
-            gray = frames[..., 0]
-        else:
-            gray = frames  # 本身就 (T,H,W)
+            bin_mask = (gray > 0).astype(np.uint8)  # (T, H, W)，值为 0 或 1
 
-        bin_mask = (gray > 0).astype(np.uint8)  # (T, H, W)，值为 0 或 1
-
-        # 4. 写回 results，供后续 Resize/Pad/... 使用
-        results[self.bin_mask] = bin_mask
+            # 4. 写回 results，供后续 Resize/Pad/... 使用
+            results[self.bin_mask].append(bin_mask)
         return results
+
+
+class Gasdata(Dataset):
+    def __init__(self,data,label):
+        self.data=data
+        self.label=label
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self,index):
+        return self.data[index],self.label[index]
+
+class GasDataLoader():
+    def __init__(self,results):
+        self.num_workers=results['num_workers']
+        self.imgs=results['imgs']
+        self.labels=results['gt_seg_maps']
+        self.batch_size=results['batch_size']
+        self.test_size=results['test_size']
+        self.val_size=results['val_size']
+    def __call__(self):
+        data_temp, data_test, label_temp, label_test = train_test_split(
+        self.imgs, self.labels, test_size=self.test_size, random_state=42)
+        #分割训练验证集
+        data_train, data_val, label_train, label_val = train_test_split(
+        data_temp, label_temp, test_size=self.val_size, random_state=42)
+        #创建数据集
+        train_dataset=Gasdata(data_train,label_train)
+        val_dataset=Gasdata(data_val,label_val)
+        test_dataset=Gasdata(data_test,label_test)
+        #创建加载器,加载器就是用来控制输入数量的
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=True, 
+            num_workers=self.num_workers, 
+            pin_memory=True
+        )
+        
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=False, 
+            num_workers=self.num_workers, 
+            pin_memory=True
+        )
+        
+        test_loader = DataLoader(
+            test_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=False, 
+            num_workers=self.num_workers, 
+            pin_memory=True
+        )
+        return train_loader,val_loader,test_loader
+        
+
+        
+
+      
