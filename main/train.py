@@ -1,13 +1,17 @@
 import os
-import process_data.process_video as process_video
-import process_data.pipeline as pipeline
+import torch
+import time
+import torch.nn as nn
+import argparse
+import torch.distributed as dist
+from torch.utils.data import DataLoader
 from process_data.pipeline import GasDataLoader
 from process_data.process_video import preprocess_sample
 from model.swin_transformer import SwinTransformer3D
-import torch
 from criterion.BCEDiceloss import BCEDiceLoss,calculate_dice
-import time
-import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
    # 在文件顶部导入库后添加
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -46,10 +50,12 @@ results = {
         'pretrained2d':False
     }
 
-def train_epoch(model,train_loader,optimizer,criterion,device):
+def train_epoch(model,train_loader,optimizer,criterion,device,epoch,is_distributed=False):
     model.train()
     train_loss=0.0
     train_dice=0.0
+    if is_distributed:#设置 sampler 的 epoch，以保证每个 epoch 的 shuffle 不同
+        train_loader.sampler.set_epoch(epoch)
     for data,label in train_loader:
         data=data.to(device)
         label=label.to(device)
@@ -58,13 +64,23 @@ def train_epoch(model,train_loader,optimizer,criterion,device):
         loss=criterion(output,label)#计算损失
         loss.backward()#计算梯度
         optimizer.step()#更新
-        train_loss+=loss.item()
-        train_dice += calculate_dice(output, label)
+        #同步loss和dice
+        current_loss=loss.detach()
+        current_dice=calculate_dice(output,label).detach()
+        if is_distributed:
+            dist.all_reduce(current_loss,op=dist.ReduceOp.SUM)
+            dist.all_reduce(current_dice,op=dist.ReduceOp.SUM)#同步广播相加求和
+            world_size=dist.get_world_size()
+            train_loss+=current_loss.item()/world_size
+            train_dice+=current_dice.item()/world_size
+        else:
+            train_loss+=current_loss.item()
+            train_dice+=current_dice.item()
     return train_loss/len(train_loader),train_dice/len(train_loader)
 #len(train_loader）代表有多少批次
 
 
-def evaluate(model,val_loader,criterion,device):
+def evaluate(model,val_loader,criterion,device,is_distributed=False):
     model.eval()
     total_loss=0
     total_dice=0
@@ -74,24 +90,85 @@ def evaluate(model,val_loader,criterion,device):
             label=label.to(device)
             output=model(data)
             loss=criterion(output,label)
-            total_loss+=loss.item()
-            total_dice+=calculate_dice(output,label)
+            current_loss=loss.detach()
+            current_dice=calculate_dice(output,label).detach()
+            if is_distributed:
+                dist.all_reduce(current_loss,op=dist.ReduceOp.SUM)
+                dist.all_reduce(current_dice,op=dist.ReduceOp.SUM)
+                world_size=dist.get_world_size()
+                total_loss+=current_loss.item()/world_size
+                total_dice+=current_dice.item()/world_size
+            else:
+                total_loss+=current_loss.item()
+                total_dice+=current_dice.item()
     return total_loss/len(val_loader),total_dice/len(val_loader)
             
 
 
 def main():
+    parser=argparse.ArgumentParser()#创建解释器
+    parser.add_argument('--local_rank',type=int,default=-1,help="DDP local rank")#创建解释器的命令
+    args=parser.parse_args()#输入赋值给args
+    #设置DDP初始化
+    is_distributed=False
+    if args.local_rank !=-1:
+        torch.cuda.set_device(args.local_rank)
+        dist.init_process_group(backend='nccl', init_method='env://')#建立全局连接
+        is_distributed = True
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        print(f"DDP: Initialized process {rank}/{world_size} on GPU {args.local_rank}")
+    #设置device
+    if is_distributed:
+        device=torch.device(f"cuda:{args.local_rank}")
+    else:
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    #判断主进程
+    is_master_process=(not is_distributed) or (rank==0)
     #保存目录
-    os.makedirs(results['model_path'],exist_ok=True)
+    data_to_broadcast = [None]
+    if is_master_process:
+        results=preprocess_sample(results)
+        results.pop('video_readers',None)
+        data_to_broadcast[0] = results
+        os.makedirs(results['model_path'],exist_ok=True)
+    if is_distributed:
+        dist.broadcast_object_list(data_to_broadcast,src=0)
+        results = data_to_broadcast[0]
+
+
+
     #加载数据
-    results=preprocess_sample(results)
-    train_loader,val_loader,test_loader=GasDataLoader(results)()
+    train_dataset,val_dataset,test_dataset=GasDataLoader(results)()
+    #创建DistributedSampler:多分布核心就是sampler使用distributedsampler
+    if is_distributed:
+        train_sampler=DistributedSampler(train_dataset,shuffle=True)
+        val_sampler=DistributedSampler(val_dataset,shuffle=False)
+        test_sampler=DistributedSampler(test_dataset,shuffle=False)
+    else:
+        train_sampler=None
+        val_sampler=None
+        test_sampler=None
+    #创建DataLoader，验证时不打乱，训练时由sampler控制，也设定为False
+    train_loader=DataLoader(train_dataset,batch_size=results['batch_size'],sampler=train_sampler,
+    shuffle=(train_sampler is None),num_workers=results['num_workers'],pin_memory=True)
+    val_loader=DataLoader(val_dataset,batch_size=results['batch_size'],sampler=val_sampler,
+    shuffle=(False),num_workers=results['num_workers'],pin_memory=True)
+    test_loader=DataLoader(test_dataset,batch_size=results['batch_size'],sampler=test_sampler,
+    shuffle=(False),num_workers=results['num_workers'],pin_memory=True)
+
+    
     #定义模型
     model=SwinTransformer3D(
                  pretrained=results['pretrained'],pretrained2d=results['pretrained2d']).to(device)
+    #使用DDP包装模型
+    if is_distributed:
+        model=DDP(model,device_ids=[args.local_rank],output_device=args.local_rank)
+    
     #显示总参数
-    total_params=sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total_params}")
+    if is_master_process:
+        total_params=sum(p.numel() for p in model.parameters())
+        print(f"Total parameters: {total_params}")
     #定义优化器
     optimizer=torch.optim.Adam(model.parameters(),lr=0.001)
     #定义学习率调度器
@@ -119,45 +196,54 @@ def main():
     for epoch in range(results['epochs']):
         print(f"\n轮次{epoch+1}/{results['epochs']}开始训练")
         #训练
-        train_loss,train_dice=train_epoch(model,train_loader,optimizer,criterion,device)
+        train_loss,train_dice=train_epoch(model,train_loader,optimizer,criterion,device,epoch,is_distributed)
         #评估
-        val_loss,val_dice=evaluate(model,val_loader,criterion,device)
-        #测试集评估
-        test_loss,test_dice=evaluate(model,test_loader,criterion,device)
+        val_loss,val_dice=evaluate(model,val_loader,criterion,device,is_distributed)
+
         #更新学习率，在每个epoch结束时更新而且不需要输入loss
         scheduler.step()
+        #只有主进程执行下面操作
+        if is_master_process:
         #记录训练历史
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['train_dice'].append(train_dice)
-        history['val_dice'].append(val_dice)
-        #打印训练信息
-        print(f"轮次{epoch+1}/{results['epochs']}训练损失:{train_loss:.4f},训练dice:{train_dice:.4f},验证损失:{val_loss:.4f},验证dice:{val_dice:.4f},测试损失:{test_loss:.4f},测试dice:{test_dice:.4f}")
-        #保存模型
-        if val_loss<best_val_loss:
-            best_val_loss=val_loss
-            best_val_dice=val_dice
-            best_epoch=epoch
-            patience_counter=0
-            current_model_path=os.path.join(results['model_path'],f'best_model_{epoch+1}.pth')
-            best_model_path=os.path.join(results['model_path'],'best_model.pth')
-            torch.save(model.state_dict(),current_model_path)
-            torch.save(model.state_dict(),best_model_path)
-            print(f"轮次{epoch+1}模型已经保存，验证损失为{val_loss:.4f}")
-        else:
-            patience_counter+=1
-            print(f"轮次{epoch+1}验证损失没有下降，当前patience为{patience_counter}/{results['patience']}")
-            if patience_counter>=results['patience']:
-                print(f"验证损失连续{results['patience']}轮没有下降，训练结束")
-                break
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+            history['train_dice'].append(train_dice)
+            history['val_dice'].append(val_dice)
+            #打印训练信息
+            print(f"轮次{epoch+1}/{results['epochs']}训练损失:{train_loss:.4f},训练dice:{train_dice:.4f},验证损失:{val_loss:.4f},验证dice:{val_dice:.4f}")
+            #保存模型
+            if val_loss<best_val_loss:
+                best_val_loss=val_loss
+                best_val_dice=val_dice
+                best_epoch=epoch
+                patience_counter=0
+                current_model_path=os.path.join(results['model_path'],f'best_model_{epoch+1}.pth')
+                best_model_path=os.path.join(results['model_path'],'best_model.pth')
+                #DDP：此时主模型已经被包装成DDP，所以需要获取.module
+                model_to_save=model.module if is_distributed else model
+                torch.save(model_to_save.state_dict(),current_model_path)
+                torch.save(model_to_save.state_dict(),best_model_path)
+                print(f"轮次{epoch+1}模型已经保存，验证损失为{val_loss:.4f}")
+            else:
+                patience_counter+=1
+                print(f"轮次{epoch+1}验证损失没有下降，当前patience为{patience_counter}/{results['patience']}")
+                if patience_counter>=results['patience']:
+                    print(f"验证损失连续{results['patience']}轮没有下降，训练结束")
+                    break
+            #测试集评估
+    test_loss,test_dice=evaluate(model,test_loader,criterion,device,is_distributed )
    # 训练时间超过一小时后不易读
-    total_time=time.time()-start_time
-    hours = int(total_time // 3600)
-    minutes = int((total_time % 3600) // 60)
-    seconds = int(total_time % 60)
-    print(f"训练结束，总训练时间: {hours}小时 {minutes}分钟 {seconds}秒")
-    print(f"最佳验证损失为{best_val_loss:.4f},最佳验证dice为{best_val_dice:.4f},最佳训练轮次为{best_epoch+1}")
-    
+    if is_master_process:
+        total_time=time.time()-start_time
+        hours = int(total_time // 3600)
+        minutes = int((total_time % 3600) // 60)
+        seconds = int(total_time % 60)
+        print(f"训练结束，总训练时间: {hours}小时 {minutes}分钟 {seconds}秒")
+        print(f"最佳验证损失为{best_val_loss:.4f},最佳验证dice为{best_val_dice:.4f},最佳训练轮次为{best_epoch+1}，
+        验证集损失为{test_loss:.4f},验证集dice为{test_dice:.4f}")
+    #DDP：主进程结束
+    if is_distributed:
+        dist.destroy_process_group()
 if __name__=='__main__':
     main()
 

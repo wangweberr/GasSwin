@@ -391,30 +391,9 @@ class GasDataLoader():
         val_dataset=Gasdata(data_val,label_val)
         test_dataset=Gasdata(data_test,label_test)
         #创建加载器,加载器就是用来控制输入数量的
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=True, 
-            num_workers=self.num_workers, 
-            pin_memory=True
-        )
+
         
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=False, 
-            num_workers=self.num_workers, 
-            pin_memory=True
-        )
-        
-        test_loader = DataLoader(
-            test_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=False, 
-            num_workers=self.num_workers, 
-            pin_memory=True
-        )
-        return train_loader,val_loader,test_loader
+        return train_dataset,val_dataset,test_dataset
         
 
         
