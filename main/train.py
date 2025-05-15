@@ -3,12 +3,13 @@ import torch
 import time
 import torch.nn as nn
 import argparse
+import logging
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from process_data.pipeline import GasDataLoader
-from process_data.process_video import preprocess_sample
-from model.swin_transformer import SwinTransformer3D
-from criterion.BCEDiceloss import BCEDiceLoss,calculate_dice
+from . import GasDataLoader
+from . import preprocess_sample
+from . import SwinTransformer3D
+from . import BCEDiceLoss,calculate_dice
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
@@ -109,8 +110,11 @@ def main():
     parser=argparse.ArgumentParser()#创建解释器
     parser.add_argument('--local_rank',type=int,default=-1,help="DDP local rank")#创建解释器的命令
     args=parser.parse_args()#输入赋值给args
+    # 添加日志记录
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     #设置DDP初始化
     is_distributed=False
+    global results
     if args.local_rank !=-1:
         torch.cuda.set_device(args.local_rank)
         dist.init_process_group(backend='nccl', init_method='env://')#建立全局连接
@@ -239,8 +243,8 @@ def main():
         minutes = int((total_time % 3600) // 60)
         seconds = int(total_time % 60)
         print(f"训练结束，总训练时间: {hours}小时 {minutes}分钟 {seconds}秒")
-        print(f"最佳验证损失为{best_val_loss:.4f},最佳验证dice为{best_val_dice:.4f},最佳训练轮次为{best_epoch+1}，
-        验证集损失为{test_loss:.4f},验证集dice为{test_dice:.4f}")
+        print(f"最佳验证损失为{best_val_loss:.4f},最佳验证dice为{best_val_dice:.4f},最佳训练轮次为{best_epoch+1}")
+        print(f"验证集损失为{test_loss:.4f},验证集dice为{test_dice:.4f}")
     #DDP：主进程结束
     if is_distributed:
         dist.destroy_process_group()

@@ -6,11 +6,11 @@ import numpy as np
 from functools import reduce
 from operator import mul
 from einops import rearrange
-from head.fpn_head import FPNHead
+from ..head import FPNHead
 from torch.nn.init import trunc_normal_
-from mmcv.cnn.bricks import DropPath
-from mmcv.runner import load_checkpoint
-from mmcv.utils import get_root_logger
+import logging
+
+
 
 class Mlp(nn.Module):
     """ Multilayer perceptron."""
@@ -464,6 +464,46 @@ class PatchEmbed3D(nn.Module):
         return x
 
 
+def drop_path(x, drop_prob: float = 0., training: bool = False, scale_by_keep: bool = True):
+    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+    
+    Args:
+        x: 输入张量
+        drop_prob: 丢弃概率，在 [0, 1] 范围内
+        training: 是否在训练模式
+        scale_by_keep: 是否按保留比例缩放
+        
+    Returns:
+        处理后的张量
+    """
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # 构建适应不同维度张量的形状
+    random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+    if keep_prob > 0.0 and scale_by_keep:
+        random_tensor.div_(keep_prob)
+    return x * random_tensor
+
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+    
+    这是 timm 库中 DropPath 的简化版本。
+    """
+    def __init__(self, drop_prob: float = 0., scale_by_keep: bool = True):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+        self.scale_by_keep = scale_by_keep
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
+
+    def extra_repr(self):
+        return f'drop_prob={round(self.drop_prob,3):0.3f}'
+
+
+
 class SwinTransformer3D(nn.Module):
     """ Swin Transformer backbone.
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
@@ -523,7 +563,8 @@ class SwinTransformer3D(nn.Module):
             norm_layer=norm_layer if self.patch_norm else None)
 
         self.pos_drop = nn.Dropout(p=drop_rate)
-
+    # 添加日志记录
+        self.logger = logging.getLogger(__name__)
         # stochastic depth
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
 
@@ -573,7 +614,9 @@ class SwinTransformer3D(nn.Module):
                 for param in m.parameters():
                     param.requires_grad = False
 
-    def inflate_weights(self, logger):
+
+
+    def inflate_weights(self):
         """Inflate the swin2d parameters to swin3d.
 
         The differences between swin3d and swin2d mainly lie in an extra
@@ -582,7 +625,7 @@ class SwinTransformer3D(nn.Module):
         the 3d counterpart.
 
         Args:
-            logger (logging.Logger): The logger used to print
+
                 debugging infomation.
         """
         checkpoint = torch.load(self.pretrained, map_location='cpu')
@@ -610,7 +653,7 @@ class SwinTransformer3D(nn.Module):
             L2 = (2*self.window_size[1]-1) * (2*self.window_size[2]-1)
             wd = self.window_size[0]
             if nH1 != nH2:
-                logger.warning(f"Error in loading {k}, passing")
+                self.logger.warning(f"Error in loading {k}, passing")
             else:
                 if L1 != L2:
                     S1 = int(L1 ** 0.5)
@@ -621,8 +664,8 @@ class SwinTransformer3D(nn.Module):
             state_dict[k] = relative_position_bias_table_pretrained.repeat(2*wd-1,1)
 
         msg = self.load_state_dict(state_dict, strict=False)
-        logger.info(msg)
-        logger.info(f"=> loaded successfully '{self.pretrained}'")
+        self.logger.info(msg)
+        self.logger.info(f"=> loaded successfully '{self.pretrained}'")
         del checkpoint
         torch.cuda.empty_cache()
 
@@ -646,12 +689,11 @@ class SwinTransformer3D(nn.Module):
             self.pretrained = pretrained
         if isinstance(self.pretrained, str):
             self.apply(_init_weights)
-            logger = get_root_logger()
-            logger.info(f'load model from: {self.pretrained}')
+            self.logger.info(f'load model from: {self.pretrained}')
 
             if self.pretrained2d:
                 # Inflate 2D model into 3D model.
-                self.inflate_weights(logger)
+                self.inflate_weights()
             else:
                 # 先加载权重到内存
                 checkpoint = torch.load(self.pretrained, map_location='cpu')
@@ -669,7 +711,7 @@ class SwinTransformer3D(nn.Module):
                         new_state_dict[k] = v # 如果有些键没有module.前缀，也保留
                 
                 if has_module_prefix:
-                    logger.info("Detected 'module.' prefix in pretrained state_dict, removing it.")
+                    self.logger.info("Detected 'module.' prefix in pretrained state_dict, removing it.")
                     state_dict = new_state_dict # 使用处理了前缀的 state_dict
   
                 # 处理通道数不匹配

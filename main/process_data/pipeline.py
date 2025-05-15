@@ -14,15 +14,14 @@ from sklearn.model_selection import train_test_split
 
 class SlidingWindowSampler:
     """动态滑窗采样，固定取 window_size 帧"""
-    def __init__(self, window_size, stride, test_mode=False):
-        self.window_size = window_size
-        self.stride = stride
+    def __init__(self, results, test_mode=False):
+        self.window_size = results['window_size']
+        self.stride = results['stride']
         self.test_mode = test_mode
     def __call__(self, results):
         if 'total_frames' not in results:
             results['total_frames'] = 451
         inds=[]
-        Video_incdice=[]
         for i,total in enumerate(results['total_frames']):
             video_inds = []
             starts = list(range(0, max(1, total - self.window_size + 1), self.stride))
@@ -36,7 +35,7 @@ class SlidingWindowSampler:
                 max_samples = max(1, (total - self.window_size) // self.stride + 1)
                 selected_starts = random.choices(starts, k=max_samples)
                 video_inds = [np.arange(s, s+self.window_size) for s in selected_starts]
-            video_inds = [np.clip(ind, 0, total - 1) for ind in video_inds]
+            video_inds = [np.clip(ind, 0, total - 1) for ind in video_inds]#索引限制不超出范围
             inds.extend(video_inds) 
             for s in video_inds:
                 results['video_indices'].append(i)
@@ -85,10 +84,12 @@ class Resize:
             resized = [cv2.resize(img, (self.w, self.h), interpolation=cv2.INTER_LINEAR) 
                       for img in vid_imgs]
             processed_imgs.append(np.stack(resized, axis=0))
+            print(f"resize完成{len(processed_imgs)}")
             
             if 'gt_seg_maps' in results:
                 vid_segs = [cv2.resize(m, (self.w, self.h), interpolation=cv2.INTER_NEAREST)
-                           for m in results['gt_seg_maps'][results['imgs'].index(vid_imgs)]]
+                           for m in results['gt_seg_maps'][next((i for i, arr in enumerate(results['imgs']) 
+                                                                 if np.array_equal(arr, vid_imgs)), 0)]]
                 processed_segs.append(np.stack(vid_segs, axis=0))
         
         results['imgs'] = processed_imgs
@@ -122,7 +123,7 @@ class PadTo:
             if 'gt_seg_maps' in results:
                 vid_segs = results['gt_seg_maps'][results['imgs'].index(vid_imgs)]
                 seg_padded = np.pad(vid_segs,
-                    ((0, pd), (0, ph), (0, pw)),
+                    ((0, pd), (0, ph), (0, pw), (0, 0)),
                     mode='constant', constant_values=0)
                 padded_segs.append(seg_padded)
         
@@ -348,6 +349,8 @@ class LoadMaskFromVideo:
         for index,ind in zip(results['video_indices'],inds):
             # 2. 用 Decord 一次性批量读取指定帧
             vr = decord.VideoReader(results['mask_location'][index], ctx=cpu(0))
+            ind = np.array(ind)
+            ind = np.clip(ind, 0, len(vr) - 1)
             frames = vr.get_batch(ind).asnumpy()  # shape: (T, H, W, C) 或 (T, H, W)
 
             # 3. 转灰度（若是三通道）并二值化（>0 视作前景）

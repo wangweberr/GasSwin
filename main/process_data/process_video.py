@@ -1,6 +1,6 @@
 # process_video.py
 import os
-from pipeline import (RandomCrop, SlidingWindowSampler, Resize, PadTo, ToTensor, Normalize, FormatShape,DecordDecode,DecordInit,
+from .pipeline import (RandomCrop, SlidingWindowSampler, Resize, PadTo, ToTensor, Normalize, FormatShape,DecordDecode,DecordInit,
                       LoadMaskFromVideo,Flip)
 
 def preprocess_sample(results):
@@ -12,9 +12,7 @@ def preprocess_sample(results):
     # 2. 滑窗采样
     decoder = DecordInit()
     results = decoder(results)
-    sampler = SlidingWindowSampler(window_size=window_size,
-                                   stride=stride,
-                                   test_mode=False)
+    sampler = SlidingWindowSampler(results)
     results = sampler(results)
     decoder_decode = DecordDecode()
     results=decoder_decode(results)
