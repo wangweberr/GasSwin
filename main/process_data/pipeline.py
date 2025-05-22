@@ -9,14 +9,15 @@ import decord
 from decord import VideoReader, cpu
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
+from natsort import natsorted
 
 
 
 class SlidingWindowSampler:
     """动态滑窗采样，固定取 window_size 帧"""
     def __init__(self, results, test_mode=False):
-        self.window_size = results['window_size']
-        self.stride = results['stride']
+        self.window_size = results['frame_size']
+        self.stride = results['frame_stride']
         self.test_mode = test_mode
     def __call__(self, results):
         if 'total_frames' not in results:
@@ -25,16 +26,12 @@ class SlidingWindowSampler:
         for i,total in enumerate(results['total_frames']):
             video_inds = []
             starts = list(range(0, max(1, total - self.window_size + 1), self.stride))
+            starts.append(max(total-self.window_size,0))
             if not starts:
                 starts = [0]
-            if self.test_mode:
-                # 测试模式取所有窗口
-                video_inds = [np.arange(s, s+self.window_size) for s in starts]
-            else:
-                # 训练模式随机选择多个窗口
-                max_samples = max(1, (total - self.window_size) // self.stride + 1)
-                selected_starts = random.choices(starts, k=max_samples)
-                video_inds = [np.arange(s, s+self.window_size) for s in selected_starts]
+        
+            video_inds = [np.arange(s, s+self.window_size) for s in starts]
+
             video_inds = [np.clip(ind, 0, total - 1) for ind in video_inds]#索引限制不超出范围
             inds.extend(video_inds) 
             for s in video_inds:
@@ -79,8 +76,7 @@ class Resize:
         processed_imgs = []
         processed_segs = []
         
-        for vid_imgs in results['imgs']:
-            T = vid_imgs.shape[0]
+        for i,vid_imgs in enumerate(results['imgs']):
             resized = [cv2.resize(img, (self.w, self.h), interpolation=cv2.INTER_LINEAR) 
                       for img in vid_imgs]
             processed_imgs.append(np.stack(resized, axis=0))
@@ -88,8 +84,7 @@ class Resize:
             
             if 'gt_seg_maps' in results:
                 vid_segs = [cv2.resize(m, (self.w, self.h), interpolation=cv2.INTER_NEAREST)
-                           for m in results['gt_seg_maps'][next((i for i, arr in enumerate(results['imgs']) 
-                                                                 if np.array_equal(arr, vid_imgs)), 0)]]
+                           for m in results['gt_seg_maps'][i]]
                 processed_segs.append(np.stack(vid_segs, axis=0))
         
         results['imgs'] = processed_imgs
@@ -109,21 +104,21 @@ class PadTo:
         padded_imgs = []
         padded_segs = []
         
-        for vid_imgs in results['imgs']:
+        for i,vid_imgs in enumerate(results['imgs']):
             T, H, W = vid_imgs.shape[:3]
             pd = (self.dd - T % self.dd) % self.dd
             ph = (self.dh - H % self.dh) % self.dh
             pw = (self.dw - W % self.dw) % self.dw
             
             vid_padded = np.pad(vid_imgs,
-                ((0, pd), (0, ph), (0, pw), (0, 0)),
+                ((0, pd), (0, ph), (0, pw)),
                 mode='constant', constant_values=0)
             padded_imgs.append(vid_padded)
             
             if 'gt_seg_maps' in results:
-                vid_segs = results['gt_seg_maps'][results['imgs'].index(vid_imgs)]
+                vid_segs = results['gt_seg_maps'][i]
                 seg_padded = np.pad(vid_segs,
-                    ((0, pd), (0, ph), (0, pw), (0, 0)),
+                    ((0, pd), (0, ph), (0, pw)),
                     mode='constant', constant_values=0)
                 padded_segs.append(seg_padded)
         
@@ -135,9 +130,9 @@ class PadTo:
 
 class RandomCrop:
     """随机裁剪到指定大小"""
-    def __init__(self, size,ratio=0.5):
+    def __init__(self, size,ratio=0.7):
         # size: int 或 (h, w)
-        self.h, self.w = (size, size) if isinstance(size, int) else size
+        self.h, self.w = size
         self.ratio=ratio
     def __call__(self, results):
         if random.random()<self.ratio:
@@ -146,14 +141,14 @@ class RandomCrop:
         cropped_imgs = []
         cropped_segs = []
         
-        for vid_imgs in results['imgs']:
+        for i,vid_imgs in enumerate(results['imgs']):
             T, H, W = vid_imgs.shape[:3]
             top = random.randint(0, max(0, H - self.h))
             left = random.randint(0, max(0, W - self.w))
-            cropped_imgs.append(vid_imgs[:, top:top+self.h, left:left+self.w, :])
+            cropped_imgs.append(vid_imgs[:, top:top+self.h, left:left+self.w])
             
             if 'gt_seg_maps' in results:
-                vid_segs = results['gt_seg_maps'][results['imgs'].index(vid_imgs)]
+                vid_segs = results['gt_seg_maps'][i]
                 cropped_segs.append(vid_segs[:, top:top+self.h, left:left+self.w])
         
         results['imgs'] = cropped_imgs
@@ -174,7 +169,7 @@ class Flip:
         for i in range(len(results['imgs'])):
             if random.random() < self.flip_ratio:
                 # 水平翻转当前视频
-                results['imgs'][i] = results['imgs'][i][:, :, ::-1, :]
+                results['imgs'][i] = results['imgs'][i][:, :, ::-1]
                 if 'gt_seg_maps' in results:
                     results['gt_seg_maps'][i] = results['gt_seg_maps'][i][:, :, ::-1]
                 flip_flags.append(True)
@@ -197,8 +192,9 @@ class Normalize:
             vid_imgs = vid_imgs.astype(np.float32)
             if self.to_bgr:
                 vid_imgs = vid_imgs[..., ::-1]
-            for c in range(vid_imgs.shape[-1]):#对每个通道进行归一化，我这里都默认是(0,1)
-                vid_imgs[..., c] = (vid_imgs[..., c] - self.mean[c]) / self.std[c]
+            """""for c in range(vid_imgs.shape[-1]):#对每个通道进行归一化，我这里都默认是(0,1)
+                vid_imgs[..., c] = (vid_imgs[..., c] - self.mean[c]) / self.std[c]"""""
+            vid_imgs=(vid_imgs-self.mean)/self.std
             results['imgs'][i]=vid_imgs
         return results
 
@@ -215,8 +211,6 @@ class ToTensor:
                 tensor_list = []
                 for vid_arr in results[k]:
                     if isinstance(vid_arr, np.ndarray):
-                        if k == 'imgs':
-                            vid_arr = vid_arr.transpose(3, 0, 1, 2)
                         tensor_list.append(torch.from_numpy(vid_arr))
                 results[k] = tensor_list
         return results
@@ -224,8 +218,8 @@ class ToTensor:
 
 class FormatShape:
     """补充 input_shape，保持 Output 统一"""
-    def __init__(self, input_format='NCTHW'):
-        assert input_format in ('NCTHW',)
+    def __init__(self, input_format='THW'):
+        assert input_format in ('THW')
         self.input_format = input_format
 
     def __call__(self, results):
@@ -236,19 +230,20 @@ class FormatShape:
         processed_masks = []
         
         for imgs in imgs_list:
-            # 为每个视频添加批次维度
-            processed = imgs.unsqueeze(0)  # 1×C×T×H×W
+            # 为每个视频添加批次维度和通道维度
+            processed = imgs.unsqueeze(0)  # 1×T×H×W
             processed_imgs.append(processed)
             input_shapes.append(tuple(processed.shape))
         
         for mask in masks_list:
                 # mask 形状为 [T,H,W]，添加通道维度和批次维度
-            processed = mask.unsqueeze(0).unsqueeze(0)  # [1,1,T,H,W]
+            processed = mask.unsqueeze(0)  # [1,T,H,W]
             processed_masks.append(processed)
             
         results['gt_seg_maps'] = processed_masks
         results['imgs'] = processed_imgs
         results['input_shape'] = input_shapes
+
         return results
 
 
@@ -278,7 +273,7 @@ class DecordInit:
             raise ImportError(
                 'Please run "pip install decord" to install Decord first.')
         all_file=os.listdir(results['filename'])
-        mp4_file=[f for f in all_file if f.endswith('.mp4')]
+        mp4_file=natsorted([f for f in all_file if f.endswith('.mp4')])
         full_path=[]
      # 直接用文件路径解码，无需 FileClient/io.BytesIO
         for file_name in mp4_file:
@@ -321,6 +316,10 @@ class DecordDecode:
                ind = np.squeeze(ind)
              # Generate frame index mapping in order
             imgs = container.get_batch(ind).asnumpy()
+            if imgs.ndim == 4 and imgs.shape[-1] == 3:
+        # 正确的RGB转灰度: Y = 0.299R + 0.587G + 0.114B
+                imgs = np.dot(imgs[..., :3], [0.299, 0.587, 0.114])
+
             results['imgs'].append(imgs)
             results['original_shape'].append(imgs[0].shape[:2])
             results['img_shape'].append(imgs[0].shape[:2])
@@ -332,20 +331,32 @@ class DecordDecode:
 class LoadMaskFromVideo:
     """按索引读取灰度分割后的视频帧并二值化为 0/1 掩码"""
     def __init__(self,
-                 mask_key='mask_video',
-                 frame_inds_key='frame_inds',
-                 bin_mask='gt_seg_maps'):
-        self.mask_key = mask_key
-        self.frame_inds_key = frame_inds_key
-        self.bin_mask = bin_mask
+                 mask_video='mask_video',
+                 frame_inds='frame_inds'):
+        self.mask_video = mask_video
+        self.frame_inds = frame_inds
 
     def __call__(self, results):
         # 1. 获取 mask 视频路径 和 需要的帧索引
-        all_mask=os.listdir(results[self.mask_key])
+        all_mask=os.listdir(results[self.mask_video])
         mask_file=[f for f in all_mask if f.endswith('.mp4')]
-        inds = results[self.frame_inds_key]
-        for file in mask_file:
-            results['mask_location'].append(os.path.join(results[self.mask_key],file))
+        mask_dict={}
+        for m in mask_file:
+            base=os.path.splitext(m)[0]
+            key=base[len('smoke_only'):]
+            mask_dict[key]=os.path.join(results[self.mask_video],m)
+        aligned=[]
+        for s in results['video_paths']:
+            base=os.path.splitext(os.path.basename(s))[0]
+            key=base[len('simgasvid'):]
+            if key in mask_dict:
+                aligned.append(mask_dict[key])
+            else:
+                raise FileNotFoundError(f'找不到 mask：{key}')
+        results['mask_location']=aligned
+
+        inds = results[self.frame_inds]
+
         for index,ind in zip(results['video_indices'],inds):
             # 2. 用 Decord 一次性批量读取指定帧
             vr = decord.VideoReader(results['mask_location'][index], ctx=cpu(0))
@@ -353,16 +364,17 @@ class LoadMaskFromVideo:
             ind = np.clip(ind, 0, len(vr) - 1)
             frames = vr.get_batch(ind).asnumpy()  # shape: (T, H, W, C) 或 (T, H, W)
 
-            # 3. 转灰度（若是三通道）并二值化（>0 视作前景）
-            if  frames.ndim == 4 and frames.shape[-1] == 1:
-                gray = frames[..., 0]#通道剔除
+            # 3. 转灰度（若是三通道）
+            if  frames.ndim == 4 and frames.shape[-1] == 3:
+                gray = np.dot(frames[..., :3], [0.299, 0.587, 0.114])
+            
             else:
                 gray = frames  # 本身就 (T,H,W)
-
-            bin_mask = (gray > 0).astype(np.uint8)  # (T, H, W)，值为 0 或 1
-
+            
+            #bin_mask = (gray > 0).astype(np.uint8)  #二值化
+            mask = gray.astype(np.float32) / 255.0
             # 4. 写回 results，供后续 Resize/Pad/... 使用
-            results[self.bin_mask].append(bin_mask)
+            results['gt_seg_maps'].append(mask)
         return results
 
 

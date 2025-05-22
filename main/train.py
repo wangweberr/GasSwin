@@ -4,6 +4,7 @@ import time
 import torch.nn as nn
 import argparse
 import logging
+from tqdm import tqdm
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from . import GasDataLoader
@@ -21,10 +22,14 @@ results = {
         'filename': '/home/chenli/weber/Video-Swin-Transformer/simulated_gas/gas',
         'model_path':'/home/chenli/weber/Video-Swin-Transformer/main/checkpoints/models',
         'pretrained':'/home/chenli/weber/Video-Swin-Transformer/pretrained/swin_tiny_patch244_window877_kinetics400_1k.pth',
+        #'pretrained':'/home/chenli/weber/Video-Swin-Transformer/main/checkpoints/models/best_model_8.pth',
         # 视频处理相关字段
         'video_readers': [],     # 视频读取器列表
         'total_frames': [],      # 各视频总帧数
+        'video_paths':[],
         'frame_inds': [],        # 采样帧索引列表
+        'frame_size': 18,        # 采样窗口大小
+        'frame_stride': 9,      # 帧间隔
         # 图像数据存储
         'imgs': [],              # 原始视频帧列表
         'original_shape': [],    # 原始视频尺寸
@@ -37,7 +42,7 @@ results = {
         # 数据加载参数
         'clip_len': 32,         # 采样窗口大小
         'frame_interval': 1,    # 帧间隔
-        'batch_size': 16,
+        'batch_size': 1,
         'test_size': 0.2,
         'val_size': 0.1,
         'num_workers': 4,
@@ -45,8 +50,7 @@ results = {
         'mask_location':[],
         'video_paths':[],
         'window_size':32,
-        'stride':16,
-        'epochs':20,
+        'epochs':50,
         'patience':10,
         'pretrained2d':False
     }
@@ -57,7 +61,19 @@ def train_epoch(model,train_loader,optimizer,criterion,device,epoch,is_distribut
     train_dice=0.0
     if is_distributed:#设置 sampler 的 epoch，以保证每个 epoch 的 shuffle 不同
         train_loader.sampler.set_epoch(epoch)
+        # 只在主进程显示进度条
+    should_print = not is_distributed or dist.get_rank() == 0
+    # 创建进度条
+    progress_bar = tqdm(
+        total=len(train_loader), 
+        desc=f"训练轮次 {epoch+1}", 
+        unit="batch",
+        disable=not should_print,
+        ncols=100,
+        leave=False
+    )
     for data,label in train_loader:
+
         data=data.to(device)
         label=label.to(device)
         optimizer.zero_grad()
@@ -77,6 +93,15 @@ def train_epoch(model,train_loader,optimizer,criterion,device,epoch,is_distribut
         else:
             train_loss+=current_loss.item()
             train_dice+=current_dice.item()
+        # 更新进度条信息
+        if should_print:
+            progress_bar.set_postfix({
+                "loss": f"{current_loss.item():.4f}",
+                "dice": f"{current_dice.item():.4f}"
+            })
+            progress_bar.update()
+    
+    progress_bar.close()
     return train_loss/len(train_loader),train_dice/len(train_loader)
 #len(train_loader）代表有多少批次
 
@@ -85,6 +110,20 @@ def evaluate(model,val_loader,criterion,device,is_distributed=False):
     model.eval()
     total_loss=0
     total_dice=0
+
+
+    # 只在主进程显示进度条
+    should_print = not is_distributed or dist.get_rank() == 0
+    # 创建进度条
+    progress_bar = tqdm(
+        total=len(val_loader), 
+        desc="验证", 
+        unit="batch",
+        disable=not should_print,
+        ncols=100,
+        leave=False
+    )
+   
     with torch.no_grad():
         for data,label in val_loader:
             data=data.to(device)
@@ -102,6 +141,16 @@ def evaluate(model,val_loader,criterion,device,is_distributed=False):
             else:
                 total_loss+=current_loss.item()
                 total_dice+=current_dice.item()
+
+            # 更新进度条信息
+            if should_print:
+                progress_bar.set_postfix({
+                    "loss": f"{current_loss.item():.4f}",
+                    "dice": f"{current_dice.item():.4f}"
+                })
+                progress_bar.update()
+    
+    progress_bar.close()
     return total_loss/len(val_loader),total_dice/len(val_loader)
             
 
@@ -130,7 +179,7 @@ def main():
     #判断主进程
     is_master_process=(not is_distributed) or (rank==0)
     #保存目录
-    data_to_broadcast = [None]
+    """"data_to_broadcast = [None]
     if is_master_process:
         results=preprocess_sample(results)
         results.pop('video_readers',None)
@@ -138,10 +187,37 @@ def main():
         os.makedirs(results['model_path'],exist_ok=True)
     if is_distributed:
         dist.broadcast_object_list(data_to_broadcast,src=0)
-        results = data_to_broadcast[0]
+        results = data_to_broadcast[0]"""
+    
 
+    #缓存部分
+    cache_file = os.path.join(results['model_path'], 'preprocessed_data.pt')
+    if os.path.exists(cache_file):
+        print(f">>> 加载预处理缓存: {cache_file}")
+        data_cache = torch.load(cache_file)
+        results['imgs']        = [img  for img in data_cache['imgs']]
+        results['gt_seg_maps'] = [m  for m   in data_cache['masks']]
+        results['img_shape']      = data_cache['img_shape']
+        results['original_shape'] = data_cache['original_shape']
+    else:
+        print(">>> 缓存不存在，执行数据预处理并保存到缓存")
+        results = preprocess_sample(results)
+        # 去掉 VideoReader 以便序列化
+        results.pop('video_readers', None)
+        os.makedirs(results['model_path'], exist_ok=True)
+        torch.save({
+            'imgs':           results['imgs'],
+            'masks':          results['gt_seg_maps'],
+            'img_shape':      results['img_shape'],
+            'original_shape': results['original_shape'],
+        }, cache_file)
+        print(f">>> 已缓存预处理数据到: {cache_file}")
+    
+    #缓存部分
 
-
+    print(f"数据形状: {results['imgs'][0].shape}")
+    print(f"标签形状: {results['gt_seg_maps'][0].shape}")
+    print(f"数据维度数: {results['imgs'][0].dim()}")
     #加载数据
     train_dataset,val_dataset,test_dataset=GasDataLoader(results)()
     #创建DistributedSampler:多分布核心就是sampler使用distributedsampler
@@ -197,8 +273,20 @@ def main():
     #开始训练时间
     start_time=time.time()
     
+    # ===== 日志文件 =====
+    # 仅主进程负责写日志文件，避免多进程冲突
+    log_file_path = None
+    if (not is_distributed) or (dist.get_rank() == 0):
+        os.makedirs(results['model_path'], exist_ok=True)
+        log_file_path = os.path.join(results['model_path'], 'train.log')
+        file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(file_handler)
+        logging.info("========== 开始新的训练任务 ==========")
+    
     for epoch in range(results['epochs']):
         print(f"\n轮次{epoch+1}/{results['epochs']}开始训练")
+        logging.info(f"轮次{epoch+1}/{results['epochs']}开始训练")
         #训练
         train_loss,train_dice=train_epoch(model,train_loader,optimizer,criterion,device,epoch,is_distributed)
         #评估
@@ -215,6 +303,7 @@ def main():
             history['val_dice'].append(val_dice)
             #打印训练信息
             print(f"轮次{epoch+1}/{results['epochs']}训练损失:{train_loss:.4f},训练dice:{train_dice:.4f},验证损失:{val_loss:.4f},验证dice:{val_dice:.4f}")
+            logging.info(f"轮次{epoch+1}/{results['epochs']} 训练loss={train_loss:.4f}, dice={train_dice:.4f}; 验证loss={val_loss:.4f}, dice={val_dice:.4f}")
             #保存模型
             if val_loss<best_val_loss:
                 best_val_loss=val_loss
@@ -228,23 +317,29 @@ def main():
                 torch.save(model_to_save.state_dict(),current_model_path)
                 torch.save(model_to_save.state_dict(),best_model_path)
                 print(f"轮次{epoch+1}模型已经保存，验证损失为{val_loss:.4f}")
+                logging.info(f"轮次{epoch+1} 新最佳模型已保存  val_loss={val_loss:.4f}")
             else:
                 patience_counter+=1
                 print(f"轮次{epoch+1}验证损失没有下降，当前patience为{patience_counter}/{results['patience']}")
+                logging.info(f"轮次{epoch+1} 验证损失未改进  patience={patience_counter}/{results['patience']}")
                 if patience_counter>=results['patience']:
                     print(f"验证损失连续{results['patience']}轮没有下降，训练结束")
+                    logging.info(f"早停: 验证损失连续{results['patience']}轮没有下降")
                     break
             #测试集评估
     test_loss,test_dice=evaluate(model,test_loader,criterion,device,is_distributed )
-   # 训练时间超过一小时后不易读
+   # 训练时间
     if is_master_process:
         total_time=time.time()-start_time
         hours = int(total_time // 3600)
         minutes = int((total_time % 3600) // 60)
         seconds = int(total_time % 60)
         print(f"训练结束，总训练时间: {hours}小时 {minutes}分钟 {seconds}秒")
+        logging.info(f"训练结束，总训练时间: {hours}h {minutes}m {seconds}s")
         print(f"最佳验证损失为{best_val_loss:.4f},最佳验证dice为{best_val_dice:.4f},最佳训练轮次为{best_epoch+1}")
+        logging.info(f"最佳验证损失 {best_val_loss:.4f}, dice {best_val_dice:.4f}, 轮次 {best_epoch+1}")
         print(f"验证集损失为{test_loss:.4f},验证集dice为{test_dice:.4f}")
+        logging.info(f"测试集: loss {test_loss:.4f}, dice {test_dice:.4f}")
     #DDP：主进程结束
     if is_distributed:
         dist.destroy_process_group()

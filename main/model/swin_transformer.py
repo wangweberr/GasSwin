@@ -395,7 +395,7 @@ class BasicLayer(nn.Module):
         
         self.downsample = downsample
         if self.downsample is not None:
-            self.downsample = downsample(dim=dim, norm_layer=norm_layer)
+            self.downsample = downsample(dim=dim//2, norm_layer=norm_layer)
 
     def forward(self, x):
         """ Forward function.
@@ -404,6 +404,10 @@ class BasicLayer(nn.Module):
             x: Input feature, tensor size (B, C, D, H, W).
         """
         # calculate attention mask for SW-MSA
+        if self.downsample is not None:
+            x = rearrange(x, 'b c d h w -> b d h w c')
+            x = self.downsample(x)
+            x = rearrange(x, 'b d h w c -> b c d h w')
         B, C, D, H, W = x.shape
         window_size, shift_size = get_window_size((D,H,W), self.window_size, self.shift_size)
         x = rearrange(x, 'b c d h w -> b d h w c')
@@ -415,8 +419,7 @@ class BasicLayer(nn.Module):
             x = blk(x, attn_mask)
         x = x.view(B, D, H, W, -1)
 
-        if self.downsample is not None:
-            x = self.downsample(x)
+
         x = rearrange(x, 'b d h w c -> b c d h w')
         return x
 
@@ -583,7 +586,7 @@ class SwinTransformer3D(nn.Module):
                 attn_drop=attn_drop_rate,
                 drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                 norm_layer=norm_layer,
-                downsample=PatchMerging if i_layer<self.num_layers-1 else None,
+                downsample=PatchMerging if i_layer > 0 else None,
                 use_checkpoint=use_checkpoint)
             self.layers.append(layer)
 
@@ -594,11 +597,10 @@ class SwinTransformer3D(nn.Module):
         self.head = FPNHead(
                                 in_channels=[96, 192, 384, 768],  # 根据backbone各层的通道数
                                 feature_strides=[4, 8, 16, 32],   # 根据下采样率
-                                out_channels=1                    # 分割输出通道数
                             )
         self._freeze_stages()
         if pretrained:
-            self.init_weights()
+            self.init_weights(self.pretrained)
     #冻结前n层的参数
     def _freeze_stages(self):
         if self.frozen_stages >= 0:
@@ -696,8 +698,13 @@ class SwinTransformer3D(nn.Module):
                 self.inflate_weights()
             else:
                 # 先加载权重到内存
+                   # 在swin_transformer.py的init_weights方法中添加调试代码
                 checkpoint = torch.load(self.pretrained, map_location='cpu')
-                state_dict = checkpoint['model']
+                print(f"预训练检查点的键: {checkpoint.keys()}")
+                if 'state_dict' in checkpoint:
+                    state_dict = checkpoint['state_dict']
+                else:
+                    state_dict = checkpoint
                 # 处理 "module." 前缀 
                 from collections import OrderedDict
                 new_state_dict = OrderedDict()
@@ -733,6 +740,7 @@ class SwinTransformer3D(nn.Module):
 
     def forward(self, x):
         """Forward function."""
+        raw_intput=x
         x = self.patch_embed(x)
         x = self.pos_drop(x)
         outs=[]
@@ -740,7 +748,7 @@ class SwinTransformer3D(nn.Module):
             x = layer(x.contiguous())
            
             outs.append(x)
-        fpn_outs=self.head(outs)
+        fpn_outs=self.head(outs,raw_intput)
 
         return fpn_outs
 
