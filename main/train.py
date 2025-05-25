@@ -178,8 +178,17 @@ def evaluate(model,val_loader,criterion,device,is_distributed=False):
 def main():
     # torchrun
     env_local_rank = os.environ.get("LOCAL_RANK")
-    # 添加日志记录
+    #配置日志以及实例化处理器
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    # 构建file_handler
+    log_file_path = None
+    if (not is_distributed) or (dist.get_rank() == 0):
+        os.makedirs(results['model_path'], exist_ok=True)
+        log_file_path = os.path.join(results['model_path'], 'train.log')
+        file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')#文件写入器
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))#设置格式
+        logging.getLogger().addHandler(file_handler)
+    
     #设置DDP初始化
     is_distributed=False
     rank = 0  # 单进程运行时，rank 为 0 
@@ -193,6 +202,7 @@ def main():
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         print(f"DDP: Initialized process {rank}/{world_size} on GPU {env_local_rank}")
+        logging.info(f"DDP: Initialized process {rank}/{world_size} on GPU {env_local_rank}")
     #设置device
     if is_distributed:
         device=torch.device(f"cuda:{env_local_rank}")
@@ -235,6 +245,9 @@ def main():
         print(f"数据形状: {results['imgs'][0].shape}")
         print(f"标签形状: {results['gt_seg_maps'][0].shape}")
         print(f"数据维度数: {results['imgs'][0].dim()}")
+        logging.info(f"数据形状: {results['imgs'][0].shape}")
+        logging.info(f"标签形状: {results['gt_seg_maps'][0].shape}")
+        logging.info(f"数据维度数: {results['imgs'][0].dim()}")
     #加载数据
     train_dataset,val_dataset,test_dataset=GasDataLoader(results)()
     #创建DistributedSampler:多分布核心就是sampler使用distributedsampler
@@ -310,16 +323,7 @@ def main():
     #开始训练时间
     start_time=time.time()
     
-    # ===== 日志文件 =====
-    # 仅主进程负责写日志文件，避免多进程冲突
-    log_file_path = None
-    if (not is_distributed) or (dist.get_rank() == 0):
-        os.makedirs(results['model_path'], exist_ok=True)
-        log_file_path = os.path.join(results['model_path'], 'train.log')
-        file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
-        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logging.getLogger().addHandler(file_handler)
-        logging.info("========== 开始新的训练任务 ==========")
+    logging.info("========== 开始新的训练任务 ==========")
     
     for epoch in range(results['epochs']):
         
