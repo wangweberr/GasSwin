@@ -71,7 +71,7 @@ class FPNHead(nn.Module):
 
                 scale_head.append(
                     Interpolate(
-                        scale_factor=2,
+                        scale_factor=(1,2,2),
                         mode='trilinear',  # 对于3D数据用trilinear
                         align_corners=self.align_corners))
             self.scale_heads.append(nn.Sequential(*scale_head))

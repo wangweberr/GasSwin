@@ -732,7 +732,7 @@ class SwinTransformer3D(nn.Module):
                 
                 # 然后加载修改后的权重
                 msg = self.load_state_dict(state_dict, strict=False)
-                print(f"加载预训练权重: {msg}")
+                print(f"加载预训练权重")
         elif self.pretrained is None:
             self.apply(_init_weights)
         else:
