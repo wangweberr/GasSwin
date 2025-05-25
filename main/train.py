@@ -18,11 +18,11 @@ import torch.amp as amp
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 results = {
-        'mask_video': '/home/chenli/weber/Video-Swin-Transformer/simulated_gas/labels',
-        'filename': '/home/chenli/weber/Video-Swin-Transformer/simulated_gas/gas',
-        'model_path':'/home/chenli/weber/Video-Swin-Transformer/main/checkpoints/models',#模型保存路径
-        'pretrained':'/home/chenli/weber/Video-Swin-Transformer/pretrained/swin_tiny_patch244_window877_kinetics400_1k.pth',
-        #'pretrained':'/home/chenli/weber/Video-Swin-Transformer/main/checkpoints/models/best_model_8.pth',
+        'mask_video': '/home/chenli/weber/GasSwin/simulated_gas/labels',
+        'filename': '/home/chenli/weber/GasSwin/simulated_gas/gas',
+        'model_path':'/home/chenli/weber/GasSwin/main/checkpoints/models',#模型保存路径
+        'pretrained':'/home/chenli/weber/GasSwin/pretrained/swin_tiny_patch244_window877_kinetics400_1k.pth',
+        #'pretrained':'/home/chenli/weber/GasSwin/main/checkpoints/models/best_model.pth',
         # 视频处理相关字段
         'video_readers': [],     # 视频读取器列表
         'total_frames': [],      # 各视频总帧数
