@@ -175,3 +175,4 @@ cython_debug/
 
 main/checkpoints/
 simulated_gas/
+pretrained/
