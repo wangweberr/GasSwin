@@ -266,13 +266,13 @@ class SwinTransformerBlock3D(nn.Module):
 
         shortcut = x
         if self.use_checkpoint:
-            x = checkpoint.checkpoint(self.forward_part1, x, mask_matrix)
+            x = checkpoint.checkpoint(self.forward_part1, x, mask_matrix,use_reentrant=False)
         else:
             x = self.forward_part1(x, mask_matrix)
         x = shortcut + self.drop_path(x)
 
         if self.use_checkpoint:
-            x = x + checkpoint.checkpoint(self.forward_part2, x)
+            x = x + checkpoint.checkpoint(self.forward_part2, x,use_reentrant=False)
         else:
             x = x + self.forward_part2(x)
 
@@ -700,7 +700,7 @@ class SwinTransformer3D(nn.Module):
                 # 先加载权重到内存
                    # 在swin_transformer.py的init_weights方法中添加调试代码
                 checkpoint = torch.load(self.pretrained, map_location='cpu')
-                print(f"预训练检查点的键: {checkpoint.keys()}")
+               # print(f"预训练检查点的键: {checkpoint.keys()}")
                 if 'state_dict' in checkpoint:
                     state_dict = checkpoint['state_dict']
                 else:
@@ -730,7 +730,7 @@ class SwinTransformer3D(nn.Module):
                         new_weight = old_weight.mean(dim=1, keepdim=True)
                         state_dict['patch_embed.proj.weight'] = new_weight
                 
-                # 然后加载修改后的权重
+                # 然后加载修改后的权重，msg方便查看权重
                 msg = self.load_state_dict(state_dict, strict=False)
                 print(f"加载预训练权重")
         elif self.pretrained is None:
